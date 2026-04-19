@@ -39,6 +39,7 @@ module "eks" {
 # =============================================================================
 
 module "eks_node" {
+  count                   = var.deploy_phase_2 ? 1 : 0
   source                  = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//eks_node?ref=master"
   cluster_name            = var.cluster_name
   private_subnet_ids      = var.private_subnet_ids
@@ -91,30 +92,38 @@ module "rds" {
   db_subnet_group_name                  = "netbox00-rds-subnetgroup-test"
   db_identifier                         = var.rds_identifier
   db_engine_type                        = "postgres"
+  db_name                               = var.rds_db_name
   db_instance_class                     = var.rds_instance_class
   db_engine_version                     = var.rds_engine_version
   db_allocated_storage                  = var.rds_allocated_storage
+  max_allocated_storage                 = var.rds_max_allocated_storage
+  type_stockage                         = var.rds_storage_type
+  db_username                           = var.rds_master_username
   backup_retention_period               = var.rds_backup_retention_period
   performance_insights_enabled          = true
   performance_insights_retention_period = 7
   license_model                         = "postgresql-license"
 
-  ingress_rules = [
-    {
-      from_port   = 5432
-      to_port     = 5432
-      protocol    = "tcp"
-      cidr_blocks = "10.0.0.0/8"
-      description = "Allow PostgreSQL access from internal network"
-    },
-    {
-      from_port                = 5432
-      to_port                  = 5432
-      protocol                 = "tcp"
-      source_security_group_id = module.eks.id_groupe_securite_control_plane
-      description              = "Allow PostgreSQL access from EKS cluster"
-    }
-  ]
+  ingress_rules = concat(
+    [
+      {
+        from_port   = 5432
+        to_port     = 5432
+        protocol    = "tcp"
+        cidr_blocks = "10.0.0.0/8"
+        description = "Allow PostgreSQL access from internal network"
+      }
+    ],
+    var.deploy_phase_2 ? [
+      {
+        from_port                = 5432
+        to_port                  = 5432
+        protocol                 = "tcp"
+        source_security_group_id = module.eks.id_groupe_securite_control_plane
+        description              = "Allow PostgreSQL access from EKS cluster"
+      }
+    ] : []
+  )
 }
 
 # =============================================================================
@@ -122,20 +131,20 @@ module "rds" {
 # =============================================================================
 
 module "redis_netbox" {
-  source             = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//redis?ref=master"
-  account_id         = local.account_id
-  private_subnet_ids = var.private_subnet_ids
-  vpc_id             = var.vpc_id
-  redis_cluster_name = var.redis_cluster_name
-  node_type          = var.redis_node_type
-  multi_az_enabled   = true
-  redis_engine_version   = "7.0"
-  maxmemory_policy       = "allkeys-lru"
-  maintenance_window     = "sun:02:00-sun:03:00"
-  snapshot_window        = "03:00-04:00"
+  source                   = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//redis?ref=master"
+  account_id               = local.account_id
+  private_subnet_ids       = var.private_subnet_ids
+  vpc_id                   = var.vpc_id
+  redis_cluster_name       = var.redis_cluster_name
+  node_type                = var.redis_node_type
+  multi_az_enabled         = true
+  redis_engine_version     = "7.0"
+  maxmemory_policy         = "allkeys-lru"
+  maintenance_window       = "sun:02:00-sun:03:00"
+  snapshot_window          = "03:00-04:00"
   snapshot_retention_limit = 7
 
-  redis_ingress_rules = [
+  redis_ingress_rules = var.deploy_phase_2 ? [
     {
       from_port                = 6379
       to_port                  = 6379
@@ -143,7 +152,7 @@ module "redis_netbox" {
       source_security_group_id = module.eks.id_groupe_securite_control_plane
       description              = "Allow Redis access from EKS pods"
     }
-  ]
+  ] : []
 
   depends_on = [module.eks]
 }
@@ -153,12 +162,12 @@ module "redis_netbox" {
 # =============================================================================
 
 module "s3_netbox_media" {
-  source                  = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//s3?ref=master"
-  account_id              = local.account_id
-  identifiant             = "netbox00-media-${var.palier}"
-  cle_chiffrement_externe = true
-  arn_cle_chiffrement     = module.keyForNetbox.key_arn
-  activer_versionnage     = true
+  source                      = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//s3?ref=master"
+  account_id                  = local.account_id
+  identifiant                 = "netbox00-media-${var.palier}"
+  cle_chiffrement_externe     = true
+  arn_cle_chiffrement         = module.keyForNetbox.key_arn
+  activer_versionnage         = true
   activer_verrouillage_objets = false
 }
 
@@ -169,7 +178,7 @@ module "s3_netbox_media" {
 locals {
   sqss_certificates = {
     netbox = {
-      domain_name = "netbox.${var.palier}.${local.domain_zone}"
+      domain_name = var.netbox_fqdn
       env_name    = var.palier
     }
   }
@@ -177,7 +186,7 @@ locals {
 
 module "certificat_netbox" {
   source            = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//certificats?ref=master"
-  aws_region        = data.aws_region.current.name
+  aws_region        = data.aws_region.current.region
   domain_zone       = local.domain_zone
   sqss_certificates = local.sqss_certificates
 }

@@ -1,6 +1,6 @@
 locals {
   account_id  = data.aws_caller_identity.current.account_id
-  region      = data.aws_region.current.name
+  region      = data.aws_region.current.region
   domain_zone = var.domain_zone
 
   registre_ecr = "${var.account_id}.dkr.ecr.ca-central-1.amazonaws.com"
@@ -31,13 +31,15 @@ locals {
         ]
         Resource = [
           "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:netbox-*",
-          module.rds.rds_secret_arn
+          "arn:aws:secretsmanager:${local.region}:${local.account_id}:secret:rds!*"
         ]
       },
       {
         Effect = "Allow"
         Action = [
+          "kms:Encrypt",
           "kms:Decrypt",
+          "kms:GenerateDataKey",
           "kms:DescribeKey"
         ]
         Resource = [
@@ -65,10 +67,11 @@ locals {
   netbox_configmap_data = {
     DB_HOST       = local.rds_host
     DB_PORT       = "5432"
-    DB_NAME       = "netbox"
+    DB_NAME       = var.rds_db_name
+    DB_SSLMODE    = "require"
     REDIS_HOST    = module.redis_netbox.redis_endpoint
     REDIS_PORT    = "6379"
-    ALLOWED_HOSTS = "[\"*\"]"
+    ALLOWED_HOSTS = "*"
     TIME_ZONE     = "America/Toronto"
   }
 }

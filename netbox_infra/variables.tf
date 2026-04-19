@@ -142,10 +142,34 @@ variable "rds_allocated_storage" {
   default     = 100
 }
 
+variable "rds_max_allocated_storage" {
+  description = "Stockage maximal autoscaling RDS (doit être > rds_allocated_storage)"
+  type        = number
+  default     = 200
+}
+
 variable "rds_backup_retention_period" {
   description = "Nombre de jours de rétention des backups (CCCS minimum 30 jours)"
   type        = number
   default     = 30
+}
+
+variable "rds_storage_type" {
+  description = "Type de stockage RDS (gp3 recommandé)"
+  type        = string
+  default     = "gp3"
+}
+
+variable "rds_master_username" {
+  description = "Nom d'utilisateur master RDS (ne pas utiliser un mot réservé comme admin)"
+  type        = string
+  default     = "netboxadmin"
+}
+
+variable "rds_db_name" {
+  description = "Nom de la base PostgreSQL utilisee par NetBox (doit correspondre a db_name du module RDS)"
+  type        = string
+  default     = "ORCL"
 }
 
 # ---- Redis ----
@@ -201,16 +225,54 @@ variable "hosted_zone_id" {
   type        = string
 }
 
+variable "acm_validation_hosted_zone_id" {
+  description = "ID de la zone hébergée Route53 utilisée pour la validation DNS ACM"
+  type        = string
+  default     = ""
+}
+
+variable "dns_validation_aws_profile" {
+  description = "Profil AWS du compte qui heberge la zone Route53 de validation DNS ACM"
+  type        = string
+  default     = "Network"
+}
+
 variable "hosted_zone_type" {
   description = "Type de zone hébergée (private/public)"
   type        = string
   default     = "private"
 }
 
+variable "external_dns_assume_role_arn" {
+  description = "ARN du rôle assumé par external-dns pour gérer les enregistrements Route53 (compte DNS central)"
+  type        = string
+  default     = "arn:aws:iam::841162671396:role/external-dns-role"
+}
+
 variable "domain_zone" {
   description = "Zone DNS principale"
   type        = string
   default     = "netbox00.aws.sante.quebec"
+}
+
+variable "netbox_fqdn" {
+  description = "FQDN public/privé de NetBox expose via Ingress ALB"
+  type        = string
+  default     = "test.netbox.aws.sante.quebec"
+}
+
+# ---- INGRESS CLASS (EKS AUTO MODE) ----
+
+variable "ingress_class_name" {
+  description = "Nom de la classe Ingress (EKS Auto Mode ALB)"
+  type        = string
+  default     = "eks-auto-alb"
+}
+
+variable "scheme" {
+  description = "Type d'ALB pour IngressClassParams (internal ou internet-facing)"
+  type        = string
+  default     = "internal"
 }
 
 # ---- NETBOX APP ----
@@ -231,6 +293,17 @@ variable "netbox_namespace" {
   description = "Namespace Kubernetes pour NetBox"
   type        = string
   default     = "netbox"
+}
+
+variable "alb_logs_bucket_name" {
+  description = "Nom du bucket S3 centralise (compte LogArchive) recevant les logs ALB"
+  type        = string
+}
+
+variable "alb_logs_prefix" {
+  description = "Prefixe des objets de logs ALB dans le bucket centralise"
+  type        = string
+  default     = "alb-logs"
 }
 
 # ---- DÉPLOIEMENT EN DEUX PHASES ----

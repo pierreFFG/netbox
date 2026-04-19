@@ -1,6 +1,7 @@
 provider "aws" {
   region      = var.region
   max_retries = 5
+
   default_tags {
     tags = {
       createur                      = "Terraform"
@@ -14,8 +15,16 @@ provider "aws" {
       SQSS_nomsystemeapplication    = var.nom_actif_informationel
       SQSS_abonnement               = var.account_id
       SQSS_classification           = var.classification
+      SQSS_recherche                = "non"
     }
   }
+}
+
+# Provider dedie au compte qui heberge la zone DNS (ex: compte Network)
+provider "aws" {
+  alias   = "network"
+  region  = var.region
+  profile = var.dns_validation_aws_profile
 }
 
 # SSM Parameters créés par le module EKS (disponibles après phase 1)

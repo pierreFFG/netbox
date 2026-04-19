@@ -1,5 +1,6 @@
 # Explication détaillée — Branche feature/netbox-infra-test
 ## Dossier netbox_infra/ — Fichier par fichier
+### Dernière mise à jour : commit 0b29083 ("plusieurs fixes")
 
 ---
 
@@ -7,510 +8,385 @@
 
 Le déploiement se fait en **2 phases** contrôlées par la variable `deploy_phase_2` :
 
-- **Phase 1** (`deploy_phase_2 = false`) : Crée toute l'infrastructure AWS (EKS, RDS, Redis, S3, KMS, ECR, certificats, CloudTrail, alarmes). Les providers Kubernetes/Helm pointent vers `localhost` (inactifs).
-- **Phase 2** (`deploy_phase_2 = true`) : Après que l'infra existe, on active les déploiements Kubernetes (namespace, addons, pod identity, deployment NetBox, ingress, worker).
+- **Phase 1** (`deploy_phase_2 = false`) : Crée toute l'infrastructure AWS (EKS, RDS, Redis, S3, KMS, ECR, certificats, CloudTrail, alarmes, IngressClass). Les providers K8s pointent vers `localhost` (inactifs).
+- **Phase 2** (`deploy_phase_2 = true`) : Active les déploiements Kubernetes (Karpenter nodes, addons, pod identity, deployment NetBox, ingress, worker, ConfigMaps, S3 media config).
 
 On fait `terraform apply` deux fois : une fois en phase 1, puis on passe `deploy_phase_2 = true` et on refait `terraform apply`.
 
+### État actuel du déploiement
+
+Le tfvars montre `deploy_phase_2 = true` et `cluster_oidc_id` est renseigné → **les deux phases ont été exécutées**. L'infra est complète.
+
 ---
 
-## Ordre de lecture recommandé
+## Liste des fichiers (17 fichiers)
 
 ```
-1. backend.tf      → Où Terraform stocke son état
-2. variables.tf    → Toutes les entrées configurables
-3. terraform.tfvars → Les valeurs concrètes
-4. provider.tf     → Comment Terraform se connecte à AWS et K8s
-5. data.tf         → Données dynamiques du compte
-6. local.tf        → Calculs internes et configurations dérivées
-7. main.tf         → Les 10 modules qui créent l'infrastructure
-8. app_secret.tf   → Secrets applicatifs NetBox
-9. cccs_compliance.tf → Conformité CCCS (CloudTrail, logs, alarmes)
-10. eks_addons.tf  → Addons Kubernetes (CSI drivers, metrics)
-11. netbox_k8s.tf  → Déploiement de l'application NetBox dans K8s
-12. outputs.tf     → Ce que Terraform expose après le déploiement
+netbox_infra/
+├── backend.tf                    # Providers requis + backend S3
+├── provider.tf                   # Connexion AWS + K8s + provider Network
+├── data.tf                       # Données dynamiques + validation compte
+├── variables.tf                  # 40+ variables d'entrée
+├── terraform.tfvars              # Valeurs concrètes (compte 629068383519)
+├── local.tf                      # Calculs, policies IAM, ConfigMap
+├── main.tf                       # 9 modules (ECR, KMS, EKS, nodes, config, RDS, Redis, S3, certificats)
+├── app_secret.tf                 # Secrets applicatifs + ConfigMap K8s
+├── cert_validation.tf            # Validation DNS ACM cross-account
+├── cccs_compliance.tf            # CloudTrail, logs Redis, alarmes CloudWatch
+├── eks_addons.tf                 # Addons Helm (CSI driver, metrics, external-dns)
+├── ingress_class_params_sc.tf    # IngressClass + IngressClassParams ALB
+├── ingress_healthcheck_patch.tf  # Patch ingress pour health check
+├── netbox_k8s.tf                 # Déploiement NetBox (web + worker + ingress)
+├── netbox_s3_media.tf            # ConfigMap extra.py pour stockage S3
+├── outputs.tf                    # 13 sorties
+├── scripts/copy_ecr_images.sh    # Script copie images Docker vers ECR
+├── k8s_common_res/               # Templates YAML pour IngressClass
+│   ├── ingress_class.yaml.tpl
+│   └── ingress_class_params.yaml.tpl
+└── docs/                         # Documentation interne
+    ├── NETBOX_DEPLOYMENT_FIXES.md
+    ├── NETBOX_DEPLOYMENT_RUNBOOK.md
+    ├── NETBOX_PROD_DEPLOY_RUNBOOK.md
+    └── NETBOX_SYSTEM_DESIGN.md
 ```
 
 ---
 
 ## 1. backend.tf — Fondations Terraform
 
-**But** : Définir les versions des plugins et où stocker l'état Terraform.
+**But** : Verrouiller les versions des plugins et configurer le stockage de l'état.
 
-### Providers requis (5)
+### Changements depuis le commit initial
 
-| Provider | Version | Rôle |
-|----------|---------|------|
-| `aws` | ~> 5.94.1 | Créer les ressources AWS (RDS, EKS, S3, etc.) |
-| `kubectl` | >= 1.14.0 | Appliquer des manifestes YAML bruts sur Kubernetes |
-| `kubernetes` | >= 2.0.0 | Gérer les ressources K8s natives (namespace, configmap) |
-| `helm` | ~> 2.12 | Installer des charts Helm (addons EKS) |
-| `random` | ~> 3.6 | Générer les mots de passe sécurisés |
+| Élément | Avant | Maintenant |
+|---------|-------|------------|
+| Provider AWS | ~> 5.94.1 | >= 6.40.0 |
+| Provider Helm | (absent) | ~> 2.14 |
+
+Le passage à AWS provider 6.x est un changement majeur (nouvelle version majeure).
 
 ### Backend S3
 
 ```
-Bucket : tf-backend-629068383519-ca-central-1
+Bucket : tf-backend-629068383519-ca-central-1 (existe déjà ✅)
 Clé    : netbox/terraform.tfstate
 ```
 
-Le state Terraform (la cartographie de toutes les ressources créées) est stocké dans S3, chiffré, avec verrouillage (`use_lockfile`) pour empêcher 2 personnes de modifier l'infra en même temps.
-
-### Lien avec les autres fichiers
-- Tous les fichiers dépendent de `backend.tf` car c'est lui qui charge les providers.
-- Le bucket S3 doit exister avant le premier `terraform init`.
-
 ---
 
-## 2. variables.tf — Les entrées configurables
+## 2. provider.tf — Les connexions
 
-**But** : Déclarer toutes les variables que l'utilisateur doit fournir. Aucune ressource n'est créée ici.
+**But** : Configurer les 5 providers (AWS, AWS Network, Kubernetes, kubectl, Helm).
 
-### Catégories de variables (30 variables)
-
-**Générales (4)** : `region`, `projet` (netbox00), `palier` (test), `environment` (Test)
-- `palier` est utilisé dans les noms de ressources (ex: `netbox00-media-test`)
-- `environment` est utilisé dans les tags SQSS
-
-**Réseau (2)** : `vpc_id`, `private_subnet_ids`
-- Le VPC et les subnets sont partagés via AWS RAM depuis le compte Network. On ne les crée pas, on les référence.
-
-**EKS (10)** : `cluster_name`, `k8s_version`, `cluster_oidc_id`, `eks_admin_role_arn`, `eks_cluster_role_name`, `eks_node_role_name`, `node_pools`, `nodepool_name`, `nodeclass_name`, `capacity_type`, `instance_categories`, `architecture`
-- `cluster_oidc_id` est vide en phase 1 (le cluster n'existe pas encore). Il est renseigné en phase 2 après la création du cluster.
-
-**ECR (1)** : `repositories` — liste d'objets décrivant les repos Docker à créer
-
-**RDS (5)** : `rds_identifier`, `rds_instance_class`, `rds_engine_version` (15.10), `rds_allocated_storage` (100 Go), `rds_backup_retention_period` (30j)
-
-**Redis (2)** : `redis_cluster_name`, `redis_node_type`
-
-**Tags SQSS (6)** : `dic`, `nom_equipe`, `nom_etab`, `nom_actif_informationel`, `account_id`, `classification`
-
-**DNS/Certificats (3)** : `hosted_zone_id`, `hosted_zone_type`, `domain_zone`
-
-**NetBox App (3)** : `netbox_image_tag` (v4.1.4), `netbox_replicas` (2), `netbox_namespace` (netbox)
-
-**Déploiement (1)** : `deploy_phase_2` (false/true) — le switch entre les 2 phases
-
-### Lien avec les autres fichiers
-- `terraform.tfvars` fournit les valeurs concrètes
-- Toutes les variables sont consommées par `main.tf`, `provider.tf`, `local.tf`, etc.
-
----
-
-## 3. terraform.tfvars — Les valeurs concrètes
-
-**But** : Remplir les variables avec les valeurs spécifiques au compte test.
-
-Points importants :
-- Les valeurs réseau (`vpc_id`, `private_subnet_ids`) sont en placeholder `XXXX` — à remplacer avec les vraies valeurs du compte 629068383519
-- `deploy_phase_2 = false` — on commence par la phase 1
-- `k8s_version = "1.35"` — version Kubernetes très récente
-- `rds_engine_version = "15.10"` — PostgreSQL 15 (pas 16)
-- `netbox_image_tag = "v4.1.4"` — NetBox v4.1.4 (pas v4.2.3)
-- Les credentials Docker Hub ne sont pas dans le tfvars (ils sont en dur dans `main.tf`)
-
-### Lien avec les autres fichiers
-- Alimente `variables.tf` qui alimente tout le reste
-
----
-
-## 4. provider.tf — Les connexions
-
-**But** : Configurer comment Terraform parle à AWS et à Kubernetes.
-
-### Provider AWS
-- Région `ca-central-1`, 5 retries
-- `default_tags` : 11 tags SQSS appliqués automatiquement à toutes les ressources
-
-### Mécanisme des 2 phases (le point clé)
-
-```
-Phase 1 (deploy_phase_2 = false) :
-  - data SSM : count = 0 → pas de lecture SSM
-  - providers K8s : host = "https://localhost" → inactifs
-  - Résultat : seules les ressources AWS sont créées
-
-Phase 2 (deploy_phase_2 = true) :
-  - data SSM : count = 1 → lit l'endpoint et le CA du cluster EKS
-  - providers K8s : host = endpoint réel → connectés au cluster
-  - Résultat : les ressources Kubernetes sont créées
-```
-
-C'est l'astuce centrale du code. Sans ça, le premier `terraform apply` planterait car les providers K8s essaieraient de se connecter à un cluster qui n'existe pas encore.
-
-### 4 providers configurés
-1. **AWS** — toujours actif
-2. **kubernetes** — actif en phase 2 seulement
-3. **kubectl** — actif en phase 2 seulement
-4. **helm** — actif en phase 2 seulement
-
-### Lien avec les autres fichiers
-- Les data SSM lisent les paramètres créés par `module "eks"` dans `main.tf`
-- Les providers K8s sont utilisés par `netbox_k8s.tf`, `eks_addons.tf`, `app_secret.tf`
-
----
-
-## 5. data.tf — Données dynamiques
-
-**But** : Récupérer des informations du compte AWS au moment de l'exécution.
+### Nouveauté : Provider AWS "network"
 
 ```hcl
-data "aws_region" "current" {}          → "ca-central-1"
-data "aws_caller_identity" "current" {} → account_id = "629068383519"
+provider "aws" {
+  alias   = "network"
+  region  = var.region
+  profile = var.dns_validation_aws_profile  # "Network"
+}
 ```
 
-### Lien avec les autres fichiers
-- `local.tf` utilise ces data pour construire `local.account_id` et `local.region`
-- Évite de mettre l'account_id en dur partout
+Ce deuxième provider AWS se connecte au **compte Network (841162671396)** via un profil AWS CLI séparé. Il est utilisé par `cert_validation.tf` pour créer les enregistrements DNS de validation ACM dans la zone Route 53 du compte Network.
+
+### Nouveauté : Tag SQSS_recherche
+
+Ajouté dans les `default_tags` : `SQSS_recherche = "non"` (en dur).
+
+### Mécanisme des 2 phases (inchangé)
+
+- Phase 1 : providers K8s pointent vers `localhost` (inactifs)
+- Phase 2 : providers K8s lisent SSM et se connectent au cluster EKS
+
+---
+
+## 3. data.tf — Données dynamiques + Validation
+
+**But** : Récupérer les infos du compte et valider qu'on est sur le bon compte.
+
+### Nouveauté : Check de validation
+
+```hcl
+check "aws_account_target_validation" {
+  assert {
+    condition     = data.aws_caller_identity.current.account_id == var.account_id
+    error_message = "Le compte AWS courant ne correspond pas à var.account_id"
+  }
+}
+```
+
+Si tu exécutes Terraform avec le mauvais profil AWS, il affiche un warning au lieu de déployer sur le mauvais compte. C'est une sécurité importante.
+
+---
+
+## 4. variables.tf — Les entrées (40+ variables)
+
+**But** : Déclarer toutes les variables configurables.
+
+### Nouvelles variables ajoutées
+
+| Variable | Défaut | Rôle |
+|----------|--------|------|
+| `rds_max_allocated_storage` | 200 | Autoscaling stockage RDS (max 200 Go) |
+| `rds_storage_type` | gp3 | Type de stockage RDS |
+| `rds_master_username` | netboxadmin | Username master RDS |
+| `rds_db_name` | ORCL | Nom de la base PostgreSQL |
+| `acm_validation_hosted_zone_id` | "" | Zone Route 53 pour validation DNS ACM |
+| `dns_validation_aws_profile` | Network | Profil AWS du compte qui héberge la zone DNS |
+| `external_dns_assume_role_arn` | arn:...external-dns-role | Rôle assumé par external-dns |
+| `netbox_fqdn` | test.netbox.aws.sante.quebec | FQDN complet de NetBox |
+| `ingress_class_name` | eks-auto-alb | Classe d'ingress EKS |
+| `scheme` | internal | Type d'ALB (interne) |
+| `alb_logs_bucket_name` | (requis) | Bucket S3 centralisé pour logs ALB |
+| `alb_logs_prefix` | alb-logs | Préfixe dans le bucket |
+
+### Variables supprimées
+
+`domain_filters`, `domain_filter_enabled` → remplacées par la config inline dans `eks_addons.tf`.
+
+---
+
+## 5. terraform.tfvars — Valeurs concrètes
+
+**But** : Les valeurs réelles du compte 629068383519.
+
+### Changements majeurs
+
+| Paramètre | Avant | Maintenant |
+|-----------|-------|------------|
+| `private_subnet_ids` | XXXX placeholder | Vrais IDs des subnets |
+| `vpc_id` | XXXX placeholder | `vpc-0841e283345d9925f` |
+| `account_id` | XXXX | `629068383519` |
+| `eks_admin_role_arn` | XXXX | ARN réel SSO |
+| `cluster_oidc_id` | "" | `71533274C5CD8191A7DD2BE829AF5D69` |
+| `deploy_phase_2` | false | **true** (les 2 phases sont faites) |
+| `hosted_zone_id` | XXXX | `Z03223882T7MQ3KRV58KY` |
+| `acm_validation_hosted_zone_id` | (nouveau) | `Z0811627115HEYTKBQUFW` |
+| `domain_zone` | netbox00.aws.sante.quebec | `aws.sante.quebec` |
+| `netbox_fqdn` | (nouveau) | `test.netbox.aws.sante.quebec` |
+| `alb_logs_bucket_name` | (nouveau) | `aws-accelerator-elb-access-logs-324037318411-ca-central-1` |
+| `alb_logs_prefix` | (nouveau) | `alb-logs/netbox00-test` |
+| `rds_db_name` | (nouveau) | `ORCL` |
+| `rds_max_allocated_storage` | (nouveau) | 200 |
+| `rds_storage_type` | (nouveau) | gp3 |
+| `rds_master_username` | (nouveau) | netboxadmin |
+| `dns_validation_aws_profile` | (nouveau) | Network |
+
+Les logs ALB sont maintenant envoyés vers un bucket centralisé du compte LogArchive (`324037318411`), pas un bucket local.
 
 ---
 
 ## 6. local.tf — Calculs internes
 
-**But** : Centraliser les valeurs calculées et les configurations complexes. C'est le "cerveau" du code.
+### Changements
 
-### Valeurs calculées
+| Élément | Avant | Maintenant |
+|---------|-------|------------|
+| `region` | `data.aws_region.current.name` | `data.aws_region.current.region` |
+| Policy Secrets Manager | `module.rds.rds_secret_arn` | `arn:...secret:rds!*` (wildcard) |
+| Policy KMS | Decrypt, DescribeKey | + `Encrypt`, `GenerateDataKey` |
+| ConfigMap `DB_NAME` | "netbox" (en dur) | `var.rds_db_name` (variable) |
+| ConfigMap `DB_SSLMODE` | (absent) | `"require"` |
+| ConfigMap `ALLOWED_HOSTS` | `["*"]` (JSON) | `"*"` (string simple) |
 
-| Local | Valeur | Usage |
-|-------|--------|-------|
-| `account_id` | 629068383519 | Noms de buckets S3, ARN |
-| `region` | ca-central-1 | ARN, registre ECR |
-| `domain_zone` | netbox00.aws.sante.quebec | Certificats, ingress |
-| `registre_ecr` | 629068383519.dkr.ecr.ca-central-1.amazonaws.com | Images Docker des addons |
-| `rds_host` | (extrait de module.rds.rds_endpoint) | ConfigMap NetBox |
-
-### Pod Identity (pod_identities)
-
-Définit un seul pod identity `netbox` avec une policy IAM qui autorise les pods à :
-1. **Lire les secrets** : `secretsmanager:GetSecretValue` sur `netbox-*` et le secret RDS auto-géré
-2. **Déchiffrer** : `kms:Decrypt` sur la clé KMS NetBox et la clé KMS RDS
-3. **Accéder à S3** : `s3:GetObject/PutObject/DeleteObject/ListBucket` sur le bucket media
-
-C'est la policy la plus importante du code : elle définit exactement ce que les pods NetBox ont le droit de faire dans AWS.
-
-### ConfigMap NetBox (netbox_configmap_data)
-
-Variables d'environnement non-sensibles injectées dans les pods :
-- `DB_HOST`, `DB_PORT`, `DB_NAME` → connexion PostgreSQL
-- `REDIS_HOST`, `REDIS_PORT` → connexion Redis
-- `ALLOWED_HOSTS` → `["*"]` (accepte toutes les requêtes)
-- `TIME_ZONE` → `America/Toronto`
-
-### Lien avec les autres fichiers
-- `pod_identities` → consommé par `module "eks_config"` dans `main.tf`
-- `netbox_configmap_data` → consommé par `kubernetes_config_map` dans `app_secret.tf`
-- `rds_host` → dépend de `module.rds` dans `main.tf`
-- `registre_ecr` → utilisé par `eks_addons.tf` pour les images Docker
+Le `DB_SSLMODE = "require"` force la connexion chiffrée entre NetBox et PostgreSQL.
 
 ---
 
-## 7. main.tf — Le cœur de l'infrastructure (10 modules)
+## 7. main.tf — Les 9 modules
 
-**But** : Appeler les modules partagés pour créer toute l'infrastructure AWS.
+### Changements par module
 
-### Module 1 : ECR (Elastic Container Registry)
+**module "eks_node"** : Ajout de `count = var.deploy_phase_2 ? 1 : 0`. Les noeuds Karpenter ne sont créés qu'en phase 2 (le cluster doit exister d'abord).
 
-```
-Source : SanteQuebec.Terraform.Modules//ecr
-```
+**module "rds"** :
+- Ajout de `db_name`, `max_allocated_storage`, `type_stockage`, `db_username` (nouvelles variables)
+- Les ingress rules RDS utilisent maintenant `concat()` avec une condition : la règle SG EKS n'est ajoutée qu'en phase 2 (quand le SG EKS existe)
 
-Crée le repo Docker `netbox-image` pour stocker l'image NetBox. Le cluster EKS étant privé (pas d'accès Internet), les images doivent être dans ECR.
+**module "redis_netbox"** : Les ingress rules sont conditionnelles (`var.deploy_phase_2 ? [...] : []`). En phase 1, pas de règle SG car le SG EKS n'existe pas encore.
 
-- `tag_mutability = "MUTABLE"` — les tags peuvent être écrasés (contrairement à notre code qui avait IMMUTABLE)
-- Configure aussi un pull-through cache Docker Hub avec les credentials en dur
-
-### Module 2 : KMS (keyForNetbox)
-
-```
-Source : SanteQuebec.Terraform.Modules//kms
-Alias  : alias/keyForNetbox
-```
-
-Crée une clé de chiffrement CMK. Utilisée pour chiffrer :
-- Le bucket S3 media
-- Le bucket S3 CloudTrail
-- Le secret applicatif NetBox
-- (La clé RDS est gérée séparément par le module RDS)
-
-### Module 3 : EKS (Cluster Kubernetes)
-
-```
-Source : SanteQuebec.Terraform.Modules//eks
-Nom    : netbox00-eks-test
-```
-
-Crée le cluster EKS avec :
-- Version K8s 1.35
-- Déployé dans les 2 subnets privés RAM
-- Rôles IAM pour le control plane et les noeuds
-- Stocke l'endpoint et le CA dans SSM (utilisés par `provider.tf` en phase 2)
-
-### Module 4 : EKS Node (Karpenter)
-
-```
-Source : SanteQuebec.Terraform.Modules//eks_node
-```
-
-Configure Karpenter pour provisionner les noeuds automatiquement :
-- `on-demand`, `amd64`, familles `c/r/m`
-- Tags SQSS sur les instances EC2
-- `depends_on = [module.eks]` — attend que le cluster existe
-
-### Module 5 : EKS Config (Pod Identity) — Phase 2 uniquement
-
-```
-Source : SanteQuebec.Terraform.Modules//eks_config
-Condition : for_each = var.deploy_phase_2 ? local.pod_identities : {}
-```
-
-Crée le rôle IAM et l'association Pod Identity pour le namespace `netbox` et le service account `netbox-sa`. En phase 1, le `for_each` est vide donc rien n'est créé.
-
-### Module 6 : RDS (PostgreSQL)
-
-```
-Source : SanteQuebec.Terraform.Modules//rds
-Nom    : netbox00-rds-postgres-test
-```
-
-Crée l'instance PostgreSQL 15.10 avec :
-- `db.t3.large`, 100 Go gp3
-- Backups 30 jours, Performance Insights activé
-- **2 règles ingress** (c'est un point important) :
-  1. Port 5432 depuis `10.0.0.0/8` (tout le réseau LZA)
-  2. Port 5432 depuis le Security Group du control plane EKS (plus restrictif)
-- Le module crée aussi automatiquement un secret RDS dans Secrets Manager avec le username/password
-
-### Module 7 : Redis
-
-```
-Source : SanteQuebec.Terraform.Modules//redis
-Nom    : netbox-redis-test
-```
-
-Crée le cluster Redis 7.0 avec :
-- `cache.t3.medium`, Multi-AZ
-- `maxmemory_policy = "allkeys-lru"` — quand la mémoire est pleine, Redis supprime les clés les moins récemment utilisées
-- Snapshots 7 jours
-- **1 règle ingress** : port 6379 depuis le SG du control plane EKS uniquement (pas le CIDR LZA)
-- `depends_on = [module.eks]`
-
-### Module 8 : S3 Media
-
-```
-Source : SanteQuebec.Terraform.Modules//s3
-Nom    : netbox00-media-test
-```
-
-Bucket S3 pour stocker les fichiers uploadés dans NetBox (images, pièces jointes). Chiffré avec la clé KMS, versioning activé.
-
-### Module 9 : Certificats ACM
-
-```
-Source : SanteQuebec.Terraform.Modules//certificats
-Domaine : netbox.test.netbox00.aws.sante.quebec
-```
-
-Crée un certificat SSL/TLS via AWS Certificate Manager pour le domaine NetBox. La validation se fait par DNS (enregistrement CNAME dans Route 53). Le certificat est ensuite attaché à l'ALB via l'ingress Kubernetes.
-
-### Lien avec les autres fichiers
-- `module.rds` → ses outputs sont utilisés par `local.tf` (rds_host) et `app_secret.tf` (rds_secret_arn)
-- `module.redis_netbox` → ses outputs sont utilisés par `local.tf` (redis_endpoint)
-- `module.eks` → ses SSM parameters sont utilisés par `provider.tf`
-- `module.keyForNetbox` → sa clé est utilisée par `app_secret.tf` et `cccs_compliance.tf`
-- `module.certificat_netbox` → son ARN est utilisé par `netbox_k8s.tf` (ingress)
+**module "certificat_netbox"** :
+- `domain_zone` changé de `local.domain_zone` à `local.domain_zone`
+- `aws_region` changé de `data.aws_region.current.name` à `data.aws_region.current.region`
+- Le domaine utilise maintenant `var.netbox_fqdn` au lieu d'être calculé
 
 ---
 
-## 8. app_secret.tf — Secrets applicatifs NetBox
+## 8. app_secret.tf — Secrets applicatifs
 
-**But** : Générer les secrets propres à l'application NetBox et créer le ConfigMap Kubernetes.
+### Changements
 
-### 3 mots de passe générés
-
-| Ressource | Longueur | Usage |
-|-----------|----------|-------|
-| `netbox_secret_key` | 50 chars | Clé secrète Django (signe les sessions, cookies, CSRF) |
-| `superuser_password` | 24 chars | Mot de passe du compte admin NetBox |
-| `superuser_api_token` | 40 chars | Token pour l'API REST NetBox |
-
-### Secret Secrets Manager : `netbox-app-secret`
-
-Stocke les 3 valeurs ci-dessus en JSON, chiffré avec la clé KMS. C'est le secret que le SPC `netbox-app-spc` va lire pour injecter les variables dans les pods.
-
-### ConfigMap Kubernetes : `netbox-config` (Phase 2 uniquement)
-
-Crée un ConfigMap avec les variables non-sensibles (DB_HOST, REDIS_HOST, etc.) définies dans `local.netbox_configmap_data`. Le `count = var.deploy_phase_2 ? 1 : 0` garantit qu'il n'est créé qu'en phase 2.
-
-### Lien avec les autres fichiers
-- Le secret `netbox_app` est référencé par `netbox_k8s.tf` (SPC `netbox-app-spc`)
-- Le ConfigMap est référencé par le deployment NetBox dans `netbox_k8s.tf`
-- La clé KMS vient de `module.keyForNetbox` dans `main.tf`
-- Les données du ConfigMap viennent de `local.tf`
+- `kubernetes_config_map` → `kubernetes_config_map_v1` (API v1 explicite)
+- Le ConfigMap dépend maintenant de `module.eks_config` au lieu de `kubernetes_namespace.netbox`
 
 ---
 
-## 9. cccs_compliance.tf — Conformité CCCS-Medium
+## 9. cert_validation.tf — NOUVEAU : Validation DNS ACM cross-account
 
-**But** : Créer les ressources de logging, audit et monitoring exigées par la conformité CCCS-Medium.
+**But** : Automatiser la validation DNS des certificats ACM en créant les enregistrements CNAME dans la zone Route 53 du compte Network.
 
-### CloudWatch Log Groups Redis (2)
+### Comment ça fonctionne
 
-- `/aws/elasticache/netbox-redis-test/slow-log` — requêtes Redis lentes
-- `/aws/elasticache/netbox-redis-test/engine-log` — logs du moteur Redis
+```
+1. module "certificat_netbox" crée le certificat ACM (statut PENDING_VALIDATION)
+2. ACM fournit des enregistrements CNAME à créer pour prouver la propriété du domaine
+3. cert_validation.tf utilise le provider "aws.network" pour créer ces CNAME
+   dans la zone Route 53 du compte Network (Z0811627115HEYTKBQUFW)
+4. ACM vérifie les CNAME → certificat passe en statut ISSUED
+5. aws_acm_certificate_validation attend que la validation soit complète
+```
 
-Ces log groups doivent exister avant que Redis ne tente d'y écrire.
-
-### S3 CloudTrail + CloudTrail
-
-- Bucket `netbox00-cloudtrail-{account_id}` chiffré KMS avec bucket policy pour CloudTrail
-- Trail `netbox00-trail` multi-région avec validation des fichiers de log
-- Capture tous les événements de management + les accès S3
-
-Note : la LZA a déjà un CloudTrail organisationnel (`AWSAccelerator-Organizations-CloudTrail`). Ce trail supplémentaire donne une granularité spécifique à NetBox.
-
-### S3 ALB Logs
-
-- Bucket `netbox00-alb-logs-{account_id}` chiffré AES256 (pas KMS, car ALB l'exige)
-- Bucket policy autorise le service ELB et le service de livraison de logs à écrire
-
-### CloudWatch Alarms (3)
-
-| Alarme | Métrique | Seuil |
-|--------|----------|-------|
-| `netbox-rds-high-cpu` | CPU RDS | > 80% pendant 10 min |
-| `netbox-rds-low-storage` | Espace libre RDS | < 5 Go |
-| `netbox-redis-high-cpu` | CPU Redis | > 80% pendant 10 min |
-
-### Lien avec les autres fichiers
-- Les log groups Redis sont utilisés par `module.redis_netbox` dans `main.tf`
-- Le bucket ALB logs est référencé par l'ingress dans `netbox_k8s.tf`
-- La clé KMS vient de `module.keyForNetbox` dans `main.tf`
+La condition `enable_acm_dns_validation` vérifie que `acm_validation_hosted_zone_id` ressemble à un vrai ID Route 53 (commence par Z). Si c'est vide, la validation est désactivée.
 
 ---
 
-## 10. eks_addons.tf — Addons Kubernetes (Phase 2 uniquement)
+## 10. cccs_compliance.tf — Conformité CCCS
 
-**But** : Installer les composants système nécessaires dans le cluster EKS via Helm.
+### Changements
 
-`count = var.deploy_phase_2 ? 1 : 0` — créé uniquement en phase 2.
+Le bucket S3 ALB logs local a été **supprimé**. Les logs ALB sont maintenant envoyés vers le bucket centralisé du compte LogArchive :
+```
+aws-accelerator-elb-access-logs-324037318411-ca-central-1/alb-logs/netbox00-test/
+```
 
-### 3 addons installés
-
-**1. secrets-store-csi-driver (v1.4.0)**
-- Le driver CSI qui permet de monter des secrets AWS comme des volumes dans les pods
-- `syncSecret.enabled = true` — synchronise les secrets AWS vers des Secrets Kubernetes
-- `enableSecretRotation = true` — détecte les changements de secrets et les met à jour
-- Toutes les images Docker pointent vers l'ECR privé (pas Docker Hub)
-
-**2. secrets-store-csi-provider-aws (v1.0.1)**
-- Le provider spécifique AWS pour le driver CSI ci-dessus
-- C'est lui qui sait parler à AWS Secrets Manager
-- Image depuis l'ECR privé
-
-**3. metrics-server (v3.12.2)**
-- Collecte les métriques CPU/mémoire des pods
-- Nécessaire pour que le HPA (Horizontal Pod Autoscaler) fonctionne
-- Image depuis l'ECR privé
-
-### IRSA Role
-
-Crée un rôle IRSA (IAM Role for Service Account) `secrets-store-irsa` qui autorise le service account `secret-store-csi-sa` à lire les secrets et paramètres SSM.
-
-### Lien avec les autres fichiers
-- `local.registre_ecr` (de `local.tf`) est utilisé pour les URLs des images
-- Dépend de `module.eks` dans `main.tf`
-- Le CSI driver est nécessaire pour que les SPC dans `netbox_k8s.tf` fonctionnent
+Le reste est inchangé : CloudWatch log groups Redis, CloudTrail S3 + trail, 3 alarmes CloudWatch.
 
 ---
 
-## 11. netbox_k8s.tf — Déploiement de NetBox (Phase 2 uniquement)
+## 11. eks_addons.tf — Addons Kubernetes
 
-**But** : Déployer l'application NetBox dans le cluster EKS. C'est le fichier le plus complexe.
+### Changements
 
-### Namespace Kubernetes
+**Nouvel addon : external-dns**
 
-Crée le namespace `netbox` avec les labels `app=netbox` et `environment=test`.
+external-dns surveille les ingress Kubernetes et crée/met à jour automatiquement les enregistrements DNS dans Route 53.
 
-### Module netbox_app
+| Paramètre | Valeur |
+|-----------|--------|
+| Image | `bitnami/external-dns:v0.20.0` (depuis ECR privé) |
+| Provider | AWS Route 53 |
+| Policy | `upsert-only` (crée/met à jour, ne supprime jamais) |
+| Domain filter | `aws.sante.quebec` |
+| Zone filter | `Z03223882T7MQ3KRV58KY` |
+| Assume role | `arn:aws:iam::841162671396:role/external-dns-role` |
 
-```
-Source : SanteQuebec.Terraform.Modules//k8s_config_apps//netbox_app
-Branche : feature/netbox-app-module (pas master !)
-```
+external-dns assume un rôle dans le compte Network pour gérer les enregistrements DNS. Quand l'ingress NetBox est créé avec l'annotation `external-dns.alpha.kubernetes.io/hostname: test.netbox.aws.sante.quebec.`, external-dns crée automatiquement l'enregistrement A/CNAME dans Route 53.
 
-Ce module crée en interne :
+**Nouvel IRSA role : external-dns-irsa**
 
-**Deployment web** (2 réplicas) :
-- Image : `{account_id}.dkr.ecr.ca-central-1.amazonaws.com/netbox-image:v4.1.4`
-- Port 8080
-- Resources : 250m-500m CPU, 512Mi-1Gi RAM
-- Probes : readiness à 45s, liveness à 90s sur `/api/`
-- ConfigMap `netbox-config` monté comme variables d'environnement
+Autorise le service account `external-dns-sa` à assumer le rôle cross-account dans le compte Network.
 
-**Deployment worker** (1 réplica) :
-- Même image mais commande différente : `python manage.py rqworker`
-- Traite les tâches asynchrones (webhooks, rapports, scripts custom)
-- Resources plus légères : 100m-250m CPU, 256Mi-512Mi RAM
+**Autre changement** : metrics-server image tag passé de `v0.7.2` à `v0.8.1`.
 
-**Service** : `service-netbox` port 80 → target 8080, type IP
-
-**2 SecretProviderClass (SPC)** :
-- `netbox-rds-spc` → lit le secret RDS auto-géré → injecte `DB_USERNAME` et `DB_PASSWORD`
-- `netbox-app-spc` → lit `netbox-app-secret` → injecte `SECRET_KEY`, `SUPERUSER_PASSWORD`, `SUPERUSER_API_TOKEN`
-
-**Ingress ALB** :
-- Classe : `eks-auto-alb` (ALB créé automatiquement par EKS)
-- Scheme : interne
-- Domaine : `netbox.test.netbox00.aws.sante.quebec`
-- Certificat ACM attaché
-- ALB group : `test-netbox`
-- Access logs vers le bucket S3 ALB logs
-- Deletion protection activée
-- Headers invalides rejetés
-
-**Topology Spread** :
-- `min_domains = 2` — les pods sont répartis sur au moins 2 AZ
-- `when_unsatisfiable = "ScheduleAnyway"` — si impossible, schedule quand même (pas de blocage)
-
-### Chaîne de dépendances
-
-```
-module.eks_config (pod identity)
-module.rds (base de données)
-module.redis_netbox (cache)
-module.certificat_netbox (certificat SSL)
-kubernetes_namespace.netbox
-kubernetes_config_map.netbox_config
-aws_secretsmanager_secret_version.netbox_app
-    └── Tout doit exister AVANT que netbox_app soit créé
-```
-
-### Lien avec les autres fichiers
-- Consomme les outputs de presque tous les autres fichiers
-- C'est le "consommateur final" de toute l'infrastructure
+**Dépendance** : `depends_on` inclut maintenant `module.eks_node[0]` (les noeuds doivent exister pour installer les addons).
 
 ---
 
-## 12. outputs.tf — Ce que Terraform expose
+## 12. ingress_class_params_sc.tf — NOUVEAU : IngressClass ALB
 
-**But** : Rendre accessibles les informations clés après le déploiement.
+**But** : Configurer la classe d'ingress pour EKS Auto Mode ALB.
 
-| Output | Source | Usage |
-|--------|--------|-------|
-| `rds_endpoint` | module.rds | Pour se connecter à PostgreSQL |
-| `rds_secret_arn` | module.rds | ARN du secret RDS auto-géré |
-| `redis_endpoint` | module.redis_netbox | Pour se connecter à Redis |
-| `redis_port` | module.redis_netbox | Port Redis (6379) |
-| `redis_secret_arn` | module.redis_netbox | ARN du secret Redis |
-| `s3_media_bucket` | module.s3_netbox_media | Nom du bucket media |
-| `certificate_arns` | module.certificat_netbox | ARN du certificat ACM |
-| `dns_validation_records` | module.certificat_netbox | CNAME pour valider le certificat |
-| `netbox_app_secret_arn` | aws_secretsmanager_secret.netbox_app | ARN du secret applicatif |
-| `netbox_url` | calculé | `https://netbox.test.netbox00.aws.sante.quebec` |
-| `cloudtrail_arn` | aws_cloudtrail.netbox | ARN du CloudTrail |
-| `alb_logs_bucket` | module.s3_alb_logs | Bucket des logs ALB |
-| `cloudtrail_bucket` | module.s3_cloudtrail | Bucket CloudTrail |
+Crée 2 ressources Kubernetes via des templates YAML :
+
+1. **IngressClassParams** : définit le scheme de l'ALB (`internal`)
+2. **IngressClass** : `eks-auto-alb` qui référence les params ci-dessus
+
+Sans ces ressources, EKS ne sait pas quel type d'ALB créer quand un ingress est déployé.
+
+---
+
+## 13. ingress_healthcheck_patch.tf — NOUVEAU : Patch Health Check
+
+**But** : Corriger le health check de l'ALB après le déploiement initial.
+
+Le module `netbox_app` crée l'ingress avec un health check sur `/api/`. Ce patch le remplace par `/static/netbox.css` qui est un fichier statique plus léger et plus fiable pour le health check ALB.
+
+Il ajoute aussi le `success-codes: "200"` explicitement.
+
+Phase 2 uniquement (`count = var.deploy_phase_2 ? 1 : 0`).
+
+---
+
+## 14. netbox_k8s.tf — Déploiement NetBox
+
+### Changements
+
+**Source du module** : passé de `ref=feature/netbox-app-module` à `ref=master` (le module a été mergé).
+
+**Namespace** : la création du namespace `kubernetes_namespace.netbox` a été **supprimée** de ce fichier. Elle est maintenant gérée par le module `netbox_app` ou par `eks_config`.
+
+**Probes** :
+- `readiness_probe_initial_delay` : 45 → **120** secondes
+- `liveness_probe_initial_delay` : 90 → **300** secondes
+- Ajout de `readiness_probe_use_tcp = true` et `liveness_probe_use_tcp = true` (TCP probe au lieu de HTTP)
+
+**Env vars secrets** : `DB_USERNAME` renommé en `DB_USER` (pour correspondre à la config NetBox).
+
+**Nouveaux env vars statiques** :
+| Variable | Valeur | Rôle |
+|----------|--------|------|
+| `SKIP_SUPERUSER` | true | Ne pas recréer le superuser à chaque démarrage |
+| `HOME` | /tmp | Répertoire home pour le processus NetBox |
+| `PGSSLMODE` | require | Force SSL vers PostgreSQL |
+| `REDIS_PASSWORD` | `module.redis_netbox.auth_token` | Token auth Redis |
+| `REDIS_SSL` | true | Force SSL vers Redis |
+
+**Ingress** :
+- `certificate_arns` et `alb_extra_attributes` utilisent maintenant les variables (`var.alb_logs_bucket_name`, `var.alb_logs_prefix`) au lieu de valeurs calculées
+- `topology_spread_when_unsatisfiable` : `ScheduleAnyway` → **`DoNotSchedule`** (plus strict : refuse de scheduler si les contraintes multi-AZ ne sont pas respectées)
+
+**Nouveau paramètre** : `extra_configmap_name = "netbox-extra-config"` — référence le ConfigMap S3 media.
+
+**Dépendances** : ajout de `kubectl_manifest.ingress_class` (l'IngressClass doit exister avant l'ingress).
+
+---
+
+## 15. netbox_s3_media.tf — NOUVEAU : Configuration S3 pour médias
+
+**But** : Configurer NetBox pour stocker les fichiers uploadés (images, pièces jointes) dans S3 au lieu du filesystem local.
+
+Crée un ConfigMap `netbox-extra-config` contenant un fichier Python `extra.py` :
+
+```python
+STORAGE_BACKEND = "storages.backends.s3boto3.S3Boto3Storage"
+STORAGE_CONFIG = {
+    "AWS_STORAGE_BUCKET_NAME": "netbox00-media-test",
+    "AWS_S3_REGION_NAME": "ca-central-1",
+    "AWS_S3_ADDRESSING_STYLE": "virtual",
+    "AWS_DEFAULT_ACL": None,
+}
+```
+
+Ce fichier est monté dans le pod NetBox et chargé par Django au démarrage. NetBox utilise alors S3 comme backend de stockage au lieu du disque local (qui serait perdu au redémarrage du pod).
+
+---
+
+## 16. outputs.tf — Sorties
+
+### Changements
+
+- `netbox_url` : calculé dynamiquement avec `var.netbox_fqdn` au lieu de `var.palier` + `var.domain_zone`
+- `alb_logs_bucket` : pointe vers `var.alb_logs_bucket_name` (bucket centralisé) au lieu du module S3 local
+
+---
+
+## 17. scripts/copy_ecr_images.sh — NOUVEAU : Script copie images
+
+**But** : Copier toutes les images Docker nécessaires vers l'ECR du compte NetBox.
+
+Le cluster EKS est privé sans accès Internet direct. Les images Docker doivent être dans l'ECR local. Ce script :
+
+1. S'authentifie sur l'ECR source (compte ProdSitesWeb 349139558736) et destination (629068383519)
+2. Crée les repos ECR dans le compte destination
+3. Copie l'image NetBox depuis Docker Hub → ECR
+4. Copie 8 images d'addons depuis l'ECR source → ECR destination :
+   - CSI Secrets Store driver + CRDs
+   - CSI node driver registrar
+   - Liveness probe
+   - Secrets Store CSI provider AWS
+   - Metrics server + addon resizer
+   - External DNS
 
 ---
 
@@ -519,37 +395,50 @@ aws_secretsmanager_secret_version.netbox_app
 ```
 terraform.tfvars
     └── variables.tf
-         └── provider.tf (tags SQSS, connexion AWS)
-         └── data.tf (account_id, region)
-              └── local.tf (calculs, policies, configmap)
-                   └── main.tf (10 modules)
-                        ├── module.ecr → ECR
+         └── provider.tf
+         │    ├── AWS provider (tags SQSS)
+         │    ├── AWS provider "network" (validation DNS ACM)
+         │    └── K8s/kubectl/Helm providers (phase 2)
+         └── data.tf (account_id + validation)
+              └── local.tf (policies, configmap, ECR registry)
+                   └── main.tf (9 modules)
+                        ├── module.ecr → ECR repos
                         ├── module.keyForNetbox → KMS
                         │    └── app_secret.tf (chiffre le secret)
                         │    └── cccs_compliance.tf (chiffre CloudTrail)
                         ├── module.eks → EKS cluster
-                        │    └── provider.tf (SSM → providers K8s)
-                        │    └── module.eks_node (Karpenter)
-                        │    └── module.eks_config (Pod Identity)
-                        │    └── eks_addons.tf (CSI drivers, metrics)
+                        │    ├── provider.tf (SSM → providers K8s)
+                        │    ├── module.eks_node (Karpenter, phase 2)
+                        │    ├── module.eks_config (Pod Identity, phase 2)
+                        │    └── eks_addons.tf (CSI, metrics, external-dns, phase 2)
                         ├── module.rds → PostgreSQL
-                        │    └── local.tf (rds_host → configmap)
+                        │    ├── local.tf (rds_host → configmap)
                         │    └── netbox_k8s.tf (SPC rds)
                         ├── module.redis_netbox → Redis
-                        │    └── local.tf (redis_endpoint → configmap)
+                        │    ├── local.tf (redis_endpoint → configmap)
+                        │    └── netbox_k8s.tf (auth_token → env var)
                         ├── module.s3_netbox_media → S3 media
-                        │    └── local.tf (policy S3 pour pods)
+                        │    ├── local.tf (policy S3 pour pods)
+                        │    └── netbox_s3_media.tf (extra.py configmap)
                         └── module.certificat_netbox → ACM
-                             └── netbox_k8s.tf (ingress)
+                             ├── cert_validation.tf (DNS validation cross-account)
+                             └── netbox_k8s.tf (ingress certificate_arns)
+
+ingress_class_params_sc.tf (IngressClass + params)
+    └── netbox_k8s.tf (depends_on ingress_class)
+
+ingress_healthcheck_patch.tf (patch health check)
+    └── depends_on module.netbox_app
 
 app_secret.tf (secret + configmap)
     └── netbox_k8s.tf (SPC app + configmap ref)
 
 cccs_compliance.tf (CloudTrail, logs, alarmes)
-    └── netbox_k8s.tf (ALB logs bucket ref)
 
-netbox_k8s.tf (namespace + module netbox_app)
-    └── outputs.tf (URL, ARNs)
+netbox_k8s.tf (module netbox_app : web + worker + service + ingress)
+    └── outputs.tf
+
+scripts/copy_ecr_images.sh (exécuté manuellement avant phase 2)
 ```
 
 ---
@@ -557,21 +446,29 @@ netbox_k8s.tf (namespace + module netbox_app)
 ## Procédure de déploiement
 
 ```bash
+# 0. Copier les images Docker vers ECR (une seule fois)
+chmod +x scripts/copy_ecr_images.sh
+./scripts/copy_ecr_images.sh
+
 # Phase 1 : Infrastructure AWS
 # deploy_phase_2 = false dans terraform.tfvars
 terraform init
 terraform plan
 terraform apply
-# → Crée : EKS, RDS, Redis, S3, KMS, ECR, certificats, CloudTrail, alarmes
+# → Crée : EKS, RDS, Redis, S3, KMS, ECR, certificats, CloudTrail,
+#           alarmes, IngressClass, secrets applicatifs
 
 # Récupérer le cluster_oidc_id
-aws eks describe-cluster --name netbox00-eks-test --query "cluster.identity.oidc.issuer" --output text
-# Extraire l'ID et le mettre dans terraform.tfvars
+aws eks describe-cluster --name netbox00-eks-test \
+  --query "cluster.identity.oidc.issuer" --output text
+# Extraire l'ID (dernière partie de l'URL) et le mettre dans terraform.tfvars
 
 # Phase 2 : Déploiements Kubernetes
 # deploy_phase_2 = true dans terraform.tfvars
-# cluster_oidc_id = "XXXXX" dans terraform.tfvars
+# cluster_oidc_id = "71533274C5CD8191A7DD2BE829AF5D69"
 terraform plan
 terraform apply
-# → Crée : namespace, addons, pod identity, deployment NetBox, worker, ingress, configmap
+# → Crée : Karpenter nodes, addons (CSI, metrics, external-dns),
+#           pod identity, deployment NetBox (web + worker),
+#           ConfigMaps, ingress ALB, health check patch, S3 media config
 ```

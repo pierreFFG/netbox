@@ -57,7 +57,7 @@ output "netbox_app_secret_arn" {
 # URL d'accès
 output "netbox_url" {
   description = "URL d'accès à NetBox"
-  value       = "https://netbox.${var.palier}.${var.domain_zone}"
+  value       = "https://${var.netbox_fqdn}"
 }
 
 # CCCS Compliance
@@ -67,8 +67,8 @@ output "cloudtrail_arn" {
 }
 
 output "alb_logs_bucket" {
-  description = "Bucket S3 pour les logs ALB"
-  value       = module.s3_alb_logs.bucket
+  description = "Bucket S3 centralise (LogArchive) pour les logs ALB"
+  value       = var.alb_logs_bucket_name
 }
 
 output "cloudtrail_bucket" {

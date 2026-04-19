@@ -48,7 +48,7 @@ resource "aws_secretsmanager_secret_version" "netbox_app" {
 # ConfigMap uniquement (le SPC est créé par le module netbox_app)
 # =============================================================================
 
-resource "kubernetes_config_map" "netbox_config" {
+resource "kubernetes_config_map_v1" "netbox_config" {
   count = var.deploy_phase_2 ? 1 : 0
   metadata {
     name      = "netbox-config"
@@ -57,5 +57,5 @@ resource "kubernetes_config_map" "netbox_config" {
 
   data = local.netbox_configmap_data
 
-  depends_on = [kubernetes_namespace.netbox]
+  depends_on = [module.eks_config]
 }

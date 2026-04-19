@@ -98,58 +98,10 @@ resource "aws_cloudtrail" "netbox" {
 }
 
 # -----------------------------------------------------------------------------
-# S3 ALB Logs (via module S3)
-# Note: ALB logs utilisent AES256, pas KMS
+# ALB Access Logs
+# Les logs ALB sont centralises dans un bucket S3 du compte LogArchive.
+# Le bucket/prefix sont fournis par variables (pas de creation locale ici).
 # -----------------------------------------------------------------------------
-
-module "s3_alb_logs" {
-  source                      = "git::https://dev.azure.com/RSSS-CEI-C/Escouade%20Voie%20Libre/_git/SanteQuebec.Terraform.Modules//s3?ref=master"
-  account_id                  = local.account_id
-  identifiant                 = "netbox00-alb-logs-${local.account_id}"
-  server_side_encryption      = "aes256"
-  activer_versionnage         = true
-  activer_verrouillage_objets = false
-
-  bucket_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "AllowELBLogs"
-        Effect = "Allow"
-        Principal = {
-          AWS = data.aws_elb_service_account.main.arn
-        }
-        Action   = "s3:PutObject"
-        Resource = "arn:aws:s3:::netbox00-alb-logs-${local.account_id}/*"
-      },
-      {
-        Sid    = "AllowLogDelivery"
-        Effect = "Allow"
-        Principal = {
-          Service = "delivery.logs.amazonaws.com"
-        }
-        Action   = "s3:PutObject"
-        Resource = "arn:aws:s3:::netbox00-alb-logs-${local.account_id}/*"
-        Condition = {
-          StringEquals = {
-            "s3:x-amz-acl" = "bucket-owner-full-control"
-          }
-        }
-      },
-      {
-        Sid    = "AllowLogDeliveryAclCheck"
-        Effect = "Allow"
-        Principal = {
-          Service = "delivery.logs.amazonaws.com"
-        }
-        Action   = "s3:GetBucketAcl"
-        Resource = "arn:aws:s3:::netbox00-alb-logs-${local.account_id}"
-      }
-    ]
-  })
-}
-
-data "aws_elb_service_account" "main" {}
 
 # -----------------------------------------------------------------------------
 # CloudWatch Alarms (CCCS: Monitoring)

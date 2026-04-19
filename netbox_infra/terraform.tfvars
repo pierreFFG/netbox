@@ -1,13 +1,13 @@
 region             = "ca-central-1"
 environment        = "Test"
-private_subnet_ids = ["subnet-XXXXXXXXXXXXXXXXX", "subnet-XXXXXXXXXXXXXXXXX"] # À remplacer avec les subnets du compte TestNetbox
-vpc_id             = "vpc-XXXXXXXXXXXXXXXXX"                                   # À remplacer avec le VPC du compte TestNetbox
+private_subnet_ids = ["subnet-00cb63a504994fdca", "subnet-06278f3fd1aad4fac"]
+vpc_id             = "vpc-0841e283345d9925f"
 
 # EKS
 cluster_name          = "netbox00-eks-test"
-cluster_oidc_id       = "" # Renseigné en phase 2 après création du cluster
+cluster_oidc_id       = "71533274C5CD8191A7DD2BE829AF5D69"
 k8s_version           = "1.35"
-eks_admin_role_arn    = "arn:aws:iam::XXXXXXXXXXXX:role/aws-reserved/sso.amazonaws.com/ca-central-1/AWSReservedSSO_SystemAdministrator_XXXXXXXXXXXXXXXX" # À remplacer
+eks_admin_role_arn    = "arn:aws:iam::629068383519:role/aws-reserved/sso.amazonaws.com/ca-central-1/AWSReservedSSO_AdministratorAccess_6e97bf1d1f25e04b"
 eks_cluster_role_name = "aws99-eks-cluster-netbox-role"
 eks_node_role_name    = "aws99-eks-node-netbox-role"
 
@@ -34,6 +34,10 @@ rds_identifier              = "netbox00-rds-postgres-test"
 rds_instance_class          = "db.t3.large"
 rds_engine_version          = "15.10"
 rds_allocated_storage       = 100
+rds_max_allocated_storage   = 200
+rds_storage_type            = "gp3"
+rds_master_username         = "netboxadmin"
+rds_db_name                 = "ORCL"
 rds_backup_retention_period = 30
 
 # Redis (CCCS-Medium: Multi-AZ, encryption, auth token)
@@ -45,20 +49,27 @@ dic                     = "4-2-1"
 nom_equipe              = "CEI"
 nom_etab                = "SanteQc"
 nom_actif_informationel = "NETBOX"
-account_id              = "XXXXXXXXXXXX" # À remplacer avec le compte TestNetbox
+account_id              = "629068383519"
 classification          = "false"
 
 # DNS
-hosted_zone_id   = "XXXXXXXXXXXXXXXXXXXXXX" # À remplacer
-hosted_zone_type = "private"
-domain_zone      = "netbox00.aws.sante.quebec"
+hosted_zone_id                = "Z03223882T7MQ3KRV58KY"
+hosted_zone_type              = "private"
+acm_validation_hosted_zone_id = "Z0811627115HEYTKBQUFW"
+domain_zone                   = "aws.sante.quebec"
+netbox_fqdn                   = "test.netbox.aws.sante.quebec"
+dns_validation_aws_profile    = "Network"
+ingress_class_name            = "eks-auto-alb"
+scheme                        = "internal"
 
 # NetBox App
-netbox_image_tag = "v4.1.4"
-netbox_replicas  = 2
-netbox_namespace = "netbox"
+netbox_image_tag     = "v4.1.4"
+netbox_replicas      = 2
+netbox_namespace     = "netbox"
+alb_logs_bucket_name = "aws-accelerator-elb-access-logs-324037318411-ca-central-1"
+alb_logs_prefix      = "alb-logs/netbox00-test"
 
 # Déploiement en deux phases
 # Phase 1 (false) : EKS, RDS, Redis, S3, KMS, ECR, Certificats, CCCS, Secrets Manager
 # Phase 2 (true)  : Addons EKS, Pod Identity, Deployments K8s, ConfigMap, Ingress
-deploy_phase_2 = false
+deploy_phase_2 = true

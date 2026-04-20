@@ -472,3 +472,211 @@ terraform apply
 #           pod identity, deployment NetBox (web + worker),
 #           ConfigMaps, ingress ALB, health check patch, S3 media config
 ```
+
+
+---
+
+## ANNEXE : Module netbox_app (SanteQuebec.Terraform.Modules//k8s_config_apps//netbox_app)
+
+### Localisation
+
+```
+SanteQuebec.Terraform.Modules/k8s_config_apps/netbox_app/
+├── main.tf              # Logique principale (7 ressources kubectl_manifest)
+├── variables.tf         # 35+ variables d'entrée
+├── requirements.tf      # Providers requis (kubectl, kubernetes, aws)
+└── templates/           # 7 templates YAML
+    ├── service_account.yaml.tpl
+    ├── secret_provider_class.yaml.tpl
+    ├── deployment.yaml.tpl
+    ├── services.yaml.tpl
+    ├── ingress_resource.yaml.tpl
+    ├── worker.yaml.tpl
+    └── pdb.yaml.tpl
+```
+
+### Rôle
+
+Ce module est le **déploiement applicatif complet de NetBox dans Kubernetes**. Il est appelé par `netbox_k8s.tf` et crée toutes les ressources K8s nécessaires pour faire tourner NetBox. C'est l'équivalent de ce que feraient des fichiers YAML `kubectl apply` manuels, mais géré par Terraform.
+
+### Ressources Kubernetes créées (7)
+
+| # | Ressource | Template | Rôle |
+|---|-----------|----------|------|
+| 1 | ServiceAccount | `service_account.yaml.tpl` | Identité K8s du pod (`netbox-sa`), liée au Pod Identity IAM |
+| 2 | SecretProviderClass (×2) | `secret_provider_class.yaml.tpl` | Pont entre Secrets Manager et les pods (1 par secret) |
+| 3 | Deployment web | `deployment.yaml.tpl` | Les pods NetBox principaux (interface web + API) |
+| 4 | Service | `services.yaml.tpl` | Expose les pods en interne sur le port 80 |
+| 5 | Ingress | `ingress_resource.yaml.tpl` | Configure l'ALB pour router le trafic externe |
+| 6 | Deployment worker | `worker.yaml.tpl` | Le pod rqworker (tâches async) |
+| 7 | PodDisruptionBudget | `pdb.yaml.tpl` | Garantit un minimum de pods pendant les maintenances |
+
+---
+
+### Détail de chaque template
+
+#### 1. service_account.yaml.tpl
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: netbox-sa
+  namespace: netbox
+```
+
+Simple ServiceAccount. Le module `eks_config` dans `main.tf` associe ce SA à un rôle IAM via Pod Identity. Quand un pod utilise ce SA, il hérite automatiquement des permissions AWS (Secrets Manager, KMS, S3).
+
+#### 2. secret_provider_class.yaml.tpl (créé 2 fois via for_each)
+
+Crée un SPC pour chaque secret AWS. Dans le cas NetBox :
+
+**SPC 1 : `netbox-rds-spc`**
+- Lit le secret RDS auto-géré dans Secrets Manager
+- Extrait `username` → `DB_USER` et `password` → `DB_PASSWORD`
+- Crée un Secret K8s `netbox-rds-spc` avec ces valeurs
+
+**SPC 2 : `netbox-app-spc`**
+- Lit le secret `netbox-app-secret` dans Secrets Manager
+- Extrait `secret_key` → `SECRET_KEY`, `superuser_password` → `SUPERUSER_PASSWORD`, `superuser_api_token` → `SUPERUSER_API_TOKEN`
+- Crée un Secret K8s `netbox-app-spc` avec ces valeurs
+
+Le mécanisme :
+```
+AWS Secrets Manager → CSI Driver → Volume monté dans /mnt/secrets-store-X
+                                 → Secret K8s synchronisé (syncSecret)
+                                      → env vars injectés via secretKeyRef
+```
+
+#### 3. deployment.yaml.tpl — Le pod web NetBox
+
+C'est le template le plus complexe. Voici ce qu'il génère :
+
+**Stratégie de déploiement** : RollingUpdate avec `maxSurge=1, maxUnavailable=0` → jamais de downtime pendant les mises à jour.
+
+**Topology Spread** : Les pods sont répartis sur au moins 2 zones de disponibilité (`minDomains: 2`). Si c'est impossible, le comportement dépend de `whenUnsatisfiable` (DoNotSchedule = refuse, ScheduleAnyway = schedule quand même).
+
+**Image** : `629068383519.dkr.ecr.ca-central-1.amazonaws.com/netbox-image:v4.1.4`
+
+**Volumes montés** :
+- `/mnt/secrets-store-0` → SPC RDS (credentials DB)
+- `/mnt/secrets-store-1` → SPC App (secrets applicatifs)
+- `/etc/netbox/config/extra.py` → ConfigMap `netbox-extra-config` (config S3 media)
+
+**Variables d'environnement** (3 sources) :
+1. `envFrom: configMapRef` → toutes les clés du ConfigMap `netbox-config` (DB_HOST, REDIS_HOST, etc.)
+2. `env: secretKeyRef` → les valeurs des SPC (DB_USER, DB_PASSWORD, SECRET_KEY, etc.)
+3. `env: value` → les extra_env statiques (SUPERUSER_NAME, HOME, PGSSLMODE, REDIS_PASSWORD, etc.)
+
+**Resources** :
+- Requests : 250m CPU, 512Mi RAM
+- Limits : 500m CPU, 1Gi RAM
+
+**Probes** :
+- Readiness : TCP port 8080, délai initial 120s, toutes les 10s
+- Liveness : TCP port 8080, délai initial 300s, toutes les 30s
+
+Les probes TCP vérifient que le port est ouvert (plus rapide et fiable que HTTP pendant le démarrage de Django).
+
+#### 4. services.yaml.tpl
+
+```yaml
+Service "service-netbox"
+  Port 80 → TargetPort 8080
+  Selector: app.kubernetes.io/name = netbox
+  Target type: ip
+```
+
+Le Service expose les pods NetBox sur le port 80 en interne. L'ALB route vers ce Service.
+
+#### 5. ingress_resource.yaml.tpl
+
+Crée l'Ingress qui configure l'ALB :
+
+```yaml
+Annotations:
+  alb.ingress.kubernetes.io/target-type: ip
+  alb.ingress.kubernetes.io/listen-ports: [{"HTTP":80},{"HTTPS":443}]
+  alb.ingress.kubernetes.io/group.name: test-netbox
+  alb.ingress.kubernetes.io/load-balancer-attributes: access_logs...deletion_protection...
+  external-dns.alpha.kubernetes.io/hostname: test.netbox.aws.sante.quebec.
+
+IngressClass: eks-auto-alb
+Host: test.netbox.aws.sante.quebec
+Path: / → service-netbox:80
+```
+
+EKS Auto Mode voit cet Ingress et crée/configure automatiquement un ALB interne avec :
+- Listener HTTP 80 + HTTPS 443
+- Certificat ACM attaché
+- Access logs vers S3
+- Deletion protection
+- Headers invalides rejetés
+- Enregistrement DNS créé par external-dns
+
+#### 6. worker.yaml.tpl — Le pod rqworker
+
+Même image que le web, mais avec une commande différente :
+```
+command: ["python", "/opt/netbox/netbox/manage.py", "rqworker"]
+```
+
+Le worker traite les tâches asynchrones de NetBox :
+- Exécution des webhooks
+- Génération des rapports
+- Scripts custom
+- Synchronisation des données
+
+Il a les mêmes volumes (secrets, extra config) et env vars que le pod web, mais pas de probes ni de Service (il ne reçoit pas de trafic HTTP).
+
+Resources plus légères : 100m-250m CPU, 256Mi-512Mi RAM.
+
+#### 7. pdb.yaml.tpl — PodDisruptionBudget
+
+```yaml
+PodDisruptionBudget "deployment-netbox-pdb"
+  minAvailable: 1  (ou maxUnavailable selon config)
+  Selector: app.kubernetes.io/name = netbox
+```
+
+Garantit qu'au moins 1 pod NetBox reste disponible pendant les opérations de maintenance (drain de noeud, mise à jour Karpenter, etc.). Kubernetes refuse d'évacuer un pod si ça violerait le PDB.
+
+Actuellement désactivé (`pdb_config = null` dans l'appel du module).
+
+---
+
+### Flux complet : du navigateur au pod
+
+```
+Utilisateur (réseau LZA)
+    │ HTTPS test.netbox.aws.sante.quebec
+    ▼
+Route 53 (zone privée Z03223882T7MQ3KRV58KY)
+    │ Résolution DNS → ALB interne
+    ▼
+ALB interne (k8s-netbox-ingressn-a68b6d46ff)
+    │ Certificat ACM, port 443
+    │ Health check: /static/netbox.css (patch)
+    ▼
+Service K8s "service-netbox" (port 80)
+    │ Target type: IP des pods
+    ▼
+Pod NetBox (deployment-netbox, 2 réplicas)
+    │ Port 8080
+    │ Image: 629068383519.dkr.ecr.../netbox-image:v4.1.4
+    │
+    │ Env vars:
+    │   ConfigMap netbox-config → DB_HOST, REDIS_HOST, TIME_ZONE...
+    │   SPC netbox-rds-spc → DB_USER, DB_PASSWORD
+    │   SPC netbox-app-spc → SECRET_KEY, SUPERUSER_PASSWORD, API_TOKEN
+    │   Extra env → PGSSLMODE=require, REDIS_SSL=true, REDIS_PASSWORD...
+    │
+    │ Volumes:
+    │   /mnt/secrets-store-0 (CSI Secrets Store → RDS secret)
+    │   /mnt/secrets-store-1 (CSI Secrets Store → App secret)
+    │   /etc/netbox/config/extra.py (ConfigMap → S3 storage config)
+    │
+    ├──── PostgreSQL (port 5432, SSL) ────► RDS netbox00-rds-postgres-test
+    ├──── Redis (port 6379, TLS) ────► ElastiCache netbox-redis-test
+    └──── S3 (HTTPS) ────► Bucket netbox00-media-test (fichiers uploadés)
+```
